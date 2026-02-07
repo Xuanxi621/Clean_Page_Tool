@@ -1,0 +1,50 @@
+﻿<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>清洁页面助手</title>
+  <link rel="stylesheet" href="popup.css" />
+</head>
+<body>
+  <header>
+    <div class="title">清洁页面助手</div>
+    <div id="status" class="status">就绪</div>
+    <button id="scanBtn" class="primary">扫描</button>
+  </header>
+
+  <div class="tabs">
+    <button class="tab active" data-tab="duplicates">重复/相似</button>
+    <button class="tab" data-tab="resources">高占用</button>
+    <button class="tab" data-tab="clusters">页面卡片</button>
+    <button class="tab" data-tab="contact">联系作者</button>
+  </div>
+
+  <main>
+    <section id="view-duplicates" class="view">
+      <div id="dup-controls" class="controls"></div>
+      <div id="dup-list"></div>
+    </section>
+    <section id="view-resources" class="view hidden">
+      <div id="res-controls" class="controls"></div>
+      <div id="res-list"></div>
+    </section>
+    <section id="view-clusters" class="view hidden">
+      <div id="cluster-controls" class="controls"></div>
+      <div id="cluster-list"></div>
+    </section>
+    <section id="view-contact" class="view hidden">
+      <div class="card contact-card">
+        <h4>作者联系方式</h4>
+        <div class="muted">作者：槐序</div>
+        <div class="muted">邮箱：2720048423@qq.com</div>
+        <div class="muted">说明：如需定制功能请联系作者</div>
+      </div>
+    </section>
+  </main>
+
+  <footer id="stats" class="stats"></footer>
+
+  <script src="popup.js"></script>
+</body>
+</html>
