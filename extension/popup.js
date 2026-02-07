@@ -380,6 +380,17 @@ function renderEstimateResources(result) {
     return;
   }
 
+  const tabMap = new Map(result.tabs.map((t) => [t.id, t]));
+  const summaryById = new Map((result.summaries || []).map((s) => [s.tabId, s]));
+  estimates = estimates.map((e) => {
+    const hasValue = (e.score || 0) > 0 || (e.memoryMB || 0) > 0 || (e.cpuPercent || 0) > 0;
+    if (hasValue) return e;
+    const t = tabMap.get(e.tabId) || {};
+    const s = summaryById.get(e.tabId) || {};
+    const fallback = estimateFromText(t, s);
+    return { ...e, ...fallback };
+  });
+
   const controls = document.createElement("div");
   controls.className = "controls";
 
@@ -418,7 +429,6 @@ function renderEstimateResources(result) {
   controls.appendChild(closeSelectedBtn);
   resControls.appendChild(controls);
 
-  const tabMap = new Map(result.tabs.map((t) => [t.id, t]));
   const metric = resourceSortBy === "cpu" ? "cpuPercent" : resourceSortBy === "memory" ? "memoryMB" : "score";
   const sorted = estimates.slice().sort((a, b) => {
     const av = Number(a[metric] || 0);
@@ -550,6 +560,21 @@ function buildFallbackEstimates(result) {
       }
     };
   });
+}
+
+function estimateFromText(tab, summary) {
+  const urlLen = (tab.url || "").length;
+  const titleLen = (tab.title || "").length;
+  const snippetLen = (summary.snippet || "").length;
+  const headingLen = (summary.headings || "").length;
+  const metaLen = (summary.meta || "").length;
+
+  const base = urlLen / 30 + titleLen / 12 + snippetLen / 400 + headingLen / 200 + metaLen / 200;
+  const score = Math.max(0.5, Math.round(base * 10) / 10);
+  const memoryMB = Math.round(score * 2.2 * 10) / 10;
+  const cpuPercent = Math.round(score * 0.6 * 10) / 10;
+
+  return { score, memoryMB, cpuPercent };
 }
 
 function renderPreciseResources(result) {

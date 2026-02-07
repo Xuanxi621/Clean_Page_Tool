@@ -1,8 +1,16 @@
 ﻿const NATIVE_HOST = "com.cleanpagetool.host";
 const SIMHASH_THRESHOLD = 5; // Hamming distance
 const DEBUGGER_PROTOCOL = "1.3";
-const MAX_CONTENT_CONCURRENCY = 6;
+const MAX_CONTENT_CONCURRENCY = 10;
 const MAX_DEBUGGER_CONCURRENCY = 4;
+const SUMMARY_TIMEOUT_MS = 3000;
+const PROCESS_MAP_TIMEOUT_MS = 3000;
+const RESOURCE_TIMEOUT_MS = 1500;
+const ENABLE_PRECISE_RESOURCES = false;
+const CAPTURE_IDLE_DELAY_MS = 1500;
+
+let scanInProgress = false;
+const captureTimers = new Map();
 const THUMBNAIL_TTL_MS = 30 * 60 * 1000;
 const MAX_THUMBNAILS = 30;
 
@@ -31,53 +39,62 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 });
 
 chrome.tabs.onActivated.addListener((activeInfo) => {
-  captureActiveTabThumbnail(activeInfo.tabId, activeInfo.windowId).catch(() => {});
+  scheduleCapture(activeInfo.tabId, activeInfo.windowId);
 });
 
 chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
   if (changeInfo.status === "complete" && tab && tab.active) {
-    captureActiveTabThumbnail(tabId, tab.windowId).catch(() => {});
+    scheduleCapture(tabId, tab.windowId);
   }
 });
 
 async function scanAllTabs() {
-  const tabs = await chrome.tabs.query({});
-  const tabInfos = tabs
-    .filter((t) => t && typeof t.id === "number")
-    .map((t) => ({
-      id: t.id,
-      windowId: t.windowId,
-      url: t.url || "",
-      title: t.title || "",
-      favIconUrl: t.favIconUrl || "",
-      active: Boolean(t.active),
-      pinned: Boolean(t.pinned),
-      lastAccessed: t.lastAccessed || 0,
-    }));
+  scanInProgress = true;
+  try {
+    const tabs = await chrome.tabs.query({});
+    const tabInfos = tabs
+      .filter((t) => t && typeof t.id === "number")
+      .map((t) => ({
+        id: t.id,
+        windowId: t.windowId,
+        url: t.url || "",
+        title: t.title || "",
+        favIconUrl: t.favIconUrl || "",
+        active: Boolean(t.active),
+        pinned: Boolean(t.pinned),
+        lastAccessed: t.lastAccessed || 0,
+      }));
 
-  const summaries = await getSummaries(tabInfos);
-  const fingerprints = buildFingerprints(tabInfos, summaries);
+    const summaries = await withTimeout(getSummaries(tabInfos), SUMMARY_TIMEOUT_MS, fallbackSummaries(tabInfos));
+    const fingerprints = buildFingerprints(tabInfos, summaries);
 
-  const duplicateGroups = buildDuplicateGroups(tabInfos, fingerprints);
-  const similarGroups = buildSimilarGroups(tabInfos, fingerprints, duplicateGroups);
-  const estimates = buildEstimates(tabInfos, summaries);
+    const duplicateGroups = buildDuplicateGroups(tabInfos, fingerprints);
+    const similarGroups = buildSimilarGroups(tabInfos, fingerprints, duplicateGroups);
+    const estimates = buildEstimates(tabInfos, summaries);
 
-  const processMap = await mapTabProcesses(tabInfos);
-  const resources = await getResourceSamples(tabInfos, processMap);
+    const processMap = ENABLE_PRECISE_RESOURCES
+      ? await withTimeout(mapTabProcesses(tabInfos), PROCESS_MAP_TIMEOUT_MS, new Map())
+      : new Map();
+    const resources = ENABLE_PRECISE_RESOURCES
+      ? await withTimeout(getResourceSamples(tabInfos, processMap), RESOURCE_TIMEOUT_MS, { ok: false, error: "resource_timeout" })
+      : { ok: false, error: "disabled" };
 
-  return {
-    ok: true,
-    generatedAt: Date.now(),
-    tabs: tabInfos,
-    summaries,
-    fingerprints,
-    groups: {
-      duplicates: duplicateGroups,
-      similar: similarGroups,
-    },
-    resources,
-    estimates,
-  };
+    return {
+      ok: true,
+      generatedAt: Date.now(),
+      tabs: tabInfos,
+      summaries,
+      fingerprints,
+      groups: {
+        duplicates: duplicateGroups,
+        similar: similarGroups,
+      },
+      resources,
+      estimates,
+    };
+  } finally {
+    scanInProgress = false;
+  }
 }
 
 async function closeTabs(tabIds) {
@@ -233,13 +250,41 @@ async function getSummaries(tabInfos) {
   return mapWithConcurrency(tabInfos, MAX_CONTENT_CONCURRENCY, (tab) => getSummaryForTab(tab));
 }
 
+function fallbackSummaries(tabInfos) {
+  return tabInfos.map((t) => ({
+    tabId: t.id,
+    title: t.title || "",
+    url: t.url || "",
+  }));
+}
+
+function sendMessageWithTimeout(tabId, message, timeoutMs) {
+  return new Promise((resolve) => {
+    let done = false;
+    const timer = setTimeout(() => {
+      if (done) return;
+      done = true;
+      resolve(null);
+    }, timeoutMs);
+
+    chrome.tabs.sendMessage(tabId, message, (response) => {
+      if (done) return;
+      done = true;
+      clearTimeout(timer);
+      const err = chrome.runtime.lastError;
+      if (err) return resolve(null);
+      resolve(response || null);
+    });
+  });
+}
+
 async function getSummaryForTab(tab) {
   if (!tab.url || isUnsupportedUrl(tab.url)) {
     return { tabId: tab.id, error: "unsupported_url", title: tab.title || "", url: tab.url || "" };
   }
 
   try {
-    const response = await chrome.tabs.sendMessage(tab.id, { type: "extractSummary" });
+    const response = await sendMessageWithTimeout(tab.id, { type: "extractSummary" }, 400);
     if (!response) {
       return { tabId: tab.id, error: "no_response", title: tab.title || "", url: tab.url || "" };
     }
@@ -247,6 +292,44 @@ async function getSummaryForTab(tab) {
   } catch (err) {
     return { tabId: tab.id, error: "extract_failed", title: tab.title || "", url: tab.url || "" };
   }
+}
+
+function scheduleCapture(tabId, windowId) {
+  if (!tabId || typeof windowId !== "number") return;
+  const key = String(windowId);
+  const existing = captureTimers.get(key);
+  if (existing) clearTimeout(existing);
+  const timer = setTimeout(() => {
+    captureTimers.delete(key);
+    if (scanInProgress) return;
+    captureActiveTabThumbnail(tabId, windowId).catch(() => {});
+  }, CAPTURE_IDLE_DELAY_MS);
+  captureTimers.set(key, timer);
+}
+
+function withTimeout(promise, ms, fallbackValue) {
+  return new Promise((resolve) => {
+    let done = false;
+    const timer = setTimeout(() => {
+      if (done) return;
+      done = true;
+      resolve(fallbackValue);
+    }, ms);
+
+    promise
+      .then((value) => {
+        if (done) return;
+        done = true;
+        clearTimeout(timer);
+        resolve(value);
+      })
+      .catch(() => {
+        if (done) return;
+        done = true;
+        clearTimeout(timer);
+        resolve(fallbackValue);
+      });
+  });
 }
 
 function isUnsupportedUrl(url) {
@@ -351,7 +434,9 @@ function buildEstimates(tabInfos, summaries) {
   return tabInfos.map((tab) => {
     const s = summaryByTab.get(tab.id) || {};
     const metrics = s.metrics || {};
-    const estimate = estimateFromMetrics(metrics);
+    const estimate = hasMeaningfulMetrics(metrics)
+      ? estimateFromMetrics(metrics)
+      : estimateFromFallback(tab, s);
     return {
       tabId: tab.id,
       score: estimate.score,
@@ -370,6 +455,35 @@ function buildEstimates(tabInfos, summaries) {
       }
     };
   });
+}
+
+function hasMeaningfulMetrics(metrics) {
+  const keys = [
+    "domCount",
+    "imageCount",
+    "videoCount",
+    "iframeCount",
+    "scriptCount",
+    "resourceCount",
+    "transferSizeKB",
+    "decodedSizeKB"
+  ];
+  return keys.some((k) => (metrics[k] || 0) > 0);
+}
+
+function estimateFromFallback(tab, summary) {
+  const urlLen = (tab.url || "").length;
+  const titleLen = (tab.title || "").length;
+  const snippetLen = (summary.snippet || "").length;
+  const headingLen = (summary.headings || "").length;
+  const metaLen = (summary.meta || "").length;
+
+  const base = urlLen / 30 + titleLen / 12 + snippetLen / 400 + headingLen / 200 + metaLen / 200;
+  const score = Math.max(0.5, Math.round(base * 10) / 10);
+  const memoryMB = Math.round(score * 2.2 * 10) / 10;
+  const cpuPercent = Math.round(score * 0.6 * 10) / 10;
+
+  return { score, memoryMB, cpuPercent };
 }
 
 function estimateFromMetrics(metrics) {
